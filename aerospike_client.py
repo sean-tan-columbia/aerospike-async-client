@@ -1,6 +1,6 @@
-# Author: Jinxiong Tan
-# Created on 07/10/2015
-# Licence: N/A
+
+# Copyright (c) 2015 Jinxiong Tan
+# GNU General public licence
 
 import aerospike as aero
 import multiprocessing
@@ -9,29 +9,38 @@ import datetime
 import sys
 
 
+# Usage example:
+# records = [Record('key_1', {'bin': 'value_1'}), Record('key_2', {'bin': 'value_2'}), Record('key_3', {'bin': 'value_3'})]
+# aerospike_client = aerospike_client.AsyncClient([(host_1:port_1), (host_2:port_2)], 'namespace', 'set', 604800)
+# success_count, failure_records = aerospike_client.put(records)
+
+
 class Record():
 
     def __init__(self, key, bins):
         """
-        :param key:
-        :param bins:
-        :return:
+        :param key: Aerospike key, should be a string
+        :param bins: Aerospike bins, should be a dictionary
+        :return: None
         """
-        self.key = key
-        self.bins = bins
+        if type(bins) is dict:
+            self.key = key
+            self.bins = bins
+        else:
+            raise TypeError('Wrong types for bins')
 
 
 class AsyncClient():
 
     def __init__(self, cluster, namespace, set_name, ttl, pool_size=4, retry_limit=3, logger=None):
         """
-        :param cluster:
-        :param namespace:
-        :param set_name:
-        :param ttl:
-        :param pool_size:
-        :param retry_limit:
-        :return:
+        :param cluster: Aerospike cluster, should have the following format, [(host_1: port_1), (host_2: port_2), ..., (host_n: port_n)]
+        :param namespace: Aerospike namespace
+        :param set_name: Aerospike set
+        :param ttl: time to live for records
+        :param pool_size: number of processes to load records
+        :param retry_limit: limit for retrying times for failure records
+        :return: None
         """
         self._cluster = cluster
         self._namespace = namespace
@@ -44,25 +53,29 @@ class AsyncClient():
 
         self._task_queue = multiprocessing.JoinableQueue()
         self._failure_queue = multiprocessing.Queue()
-        self._processors = [Processor(cluster, namespace, set_name, ttl, self._task_queue, self._failure_queue, self._retry_limit) for i in xrange(self._pool_size)]
+        self._processors = [_Processor(cluster, namespace, set_name, ttl, self._task_queue, self._failure_queue, self._retry_limit) for i in xrange(self._pool_size)]
 
     def put(self, records):
+        """
+        :param records: Record object collection
+        :return: success record count and collection of failure records (after retries)
+        """
 
         for processor in self._processors:
             processor.start()
 
         total = len(records)
         put_count = 0
+        self._log('Loading records to {0}'.format(self._cluster))
         for record in records:
-            if put_count == 0:
-                self._log('Loading records to {0}'.format(self._cluster))
-            elif put_count % 1000 == 0:
+            if not isinstance(record, Record):
+                raise Exception('Wrong type for aerospike object')
+            if put_count % 1000 == 0 and put_count > 0:
                 self._log('Finished {0}%'.format(int(float(put_count)/total*100)))
-            elif put_count == total - 1:
-                 self._log('Finished 100%')
             for node_index in xrange(len(self._cluster)):
-                self._task_queue.put(Put(node_index, record))
+                self._task_queue.put(_Put(node_index, record))
             put_count += 1
+        self._log('Finished 100%')
 
         self._task_queue.join()
         for i in xrange(self._pool_size):
@@ -91,22 +104,22 @@ class AsyncClient():
             self._logger.logging(log)
 
 
-class Processor(multiprocessing.Process):
+class _Processor(multiprocessing.Process):
 
     def __init__(self, cluster, namespace, set_name, ttl, task_queue, failure_queue, retry_limit):
         """
-        :param task_queue:
-        :param failure_queue:
-        :return:
+        :param task_queue: process-shared queue to contain tasks
+        :param failure_queue: process-shared queue to contain failure records after retries
+        :return: None
         """
-        super(Processor, self).__init__()
+        super(_Processor, self).__init__()
         self._task_queue = task_queue
         self._failure_queue = failure_queue
         self._retry_limit = retry_limit
 
         self.aerospike_dao = []
         for node in cluster:
-            self.aerospike_dao.append(AerospikeDao(node, namespace, set_name, ttl))
+            self.aerospike_dao.append(_AerospikeDao(node, namespace, set_name, ttl))
 
     def run(self):
         while True:
@@ -126,13 +139,13 @@ class Processor(multiprocessing.Process):
         return
 
 
-class Put():
+class _Put():
 
     def __init__(self, dao_index, record):
         """
-        :param dao_index:
-        :param record:
-        :return:
+        :param dao_index: unique index for each node's aerospike-dao
+        :param record: record to put
+        :return: None
         """
         self.dao_index = dao_index
         self.record = record
@@ -148,11 +161,11 @@ class Put():
         return 'key={key},bins={bins}'.format(key=self.record.key, bins=self.record.bins)
 
 
-class AerospikeDao():
+class _AerospikeDao():
 
-    def __init__(self, node, namespace, set_name, ttl):
+    def __init__(self, host, namespace, set_name, ttl):
         """
-        :param node:
+        :param host:
         :param namespace:
         :param set_name:
         :param ttl:
@@ -163,13 +176,13 @@ class AerospikeDao():
         self._ttl = ttl
         for attempt in xrange(2):
             try:
-                self._aerospike_client = aero.client({'hosts': [node]}).connect()
+                self._aerospike_client = aero.client({'hosts': [host]}).connect()
             except Exception as e:
                 print e
             else:
                 break
         else:
-            raise Exception('[Error] 3 failed attempts for connecting to {node}'.format(node=node))
+            raise Exception('[Error] 3 failed attempts for connecting to {host}'.format(host=host))
 
     def put(self, key, bins):
         """
@@ -198,8 +211,3 @@ class AerospikeDao():
 
     def close(self):
         self._aerospike_client.close()
-
-
-def print_progress_bar(total, done):
-    percentile = float(done)/float(total)
-    sys.stdout.write('\r[{0}{1}]\t{2}%'.format('#'*int(percentile*50), ' '*int((1-percentile)*50), int(percentile*100)))
