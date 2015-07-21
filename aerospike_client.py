@@ -1,4 +1,5 @@
 
+
 # Copyright (c) 2015 Jinxiong Tan
 # GNU General public licence
 
@@ -30,7 +31,88 @@ class Record():
             raise TypeError('Wrong types for bins')
 
 
-class AsyncClient():
+class Client(object):
+
+    def __init__(self, cluster, namespace, set_name, ttl, retry_limit, logger):
+        self._cluster = cluster
+        self._namespace = namespace
+        self._set_name = set_name
+        self._ttl = ttl
+        self._retry_limit = retry_limit
+        self._logger = logger
+
+    def put(self, records):
+        raise NotImplementedError
+
+    def get(self, key):
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+    def _log(self, content):
+        log = '{timestamp}: {content}'.format(timestamp=datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S'), content=content)
+        if self._logger is None:
+            print log
+        else:
+            self._logger.logging(log)
+
+
+class SyncClient(Client):
+
+    def __init__(self, cluster, namespace, set_name, ttl, retry_limit=3, logger=None):
+        """
+        :param cluster: Aerospike cluster, should have the following format, [(host_1: port_1), (host_2: port_2), ..., (host_n: port_n)]
+        :param namespace: Aerospike namespace
+        :param set_name: Aerospike set
+        :param ttl: time to live for records
+        :return: None
+        """
+        super(SyncClient, self).__init__(cluster, namespace, set_name, ttl, retry_limit, logger)
+        self.aerospike_dao = []
+        for node in cluster:
+            self.aerospike_dao.append(_AerospikeDao(node, namespace, set_name, ttl))
+
+    def put(self, records):
+        failure_records = []
+        total = len(records)
+        put_count = 0
+
+        self._log('Loading records to {0}'.format(self._cluster))
+        for record in records:
+            if not isinstance(record, Record):
+                raise Exception('Wrong type for aerospike object')
+            if put_count % 1000 == 0 and put_count > 0:
+                self._log('Finished {0}%'.format(int(float(put_count)/total*100)))
+            for aerospike_dao in self.aerospike_dao:
+                for attempt in xrange(1 + self._retry_limit):
+                    try:
+                        aerospike_dao.put(record.key, record.bins)
+                    except Exception as e:
+                        print e
+                    else:
+                        break
+                else:
+                    failure_records.append(record.key)
+            put_count += 1
+        self._log('Finished 100%')
+        return len(records) - len(failure_records), failure_records
+
+    def get(self, key):
+        try:
+            bins = self.aerospike_dao[0].get(key)
+        except Exception as e:
+            print e
+            return None
+        else:
+            return bins
+
+    def close(self):
+        for aerospike_dao in self.aerospike_dao:
+            aerospike_dao.close()
+
+
+class AsyncClient(Client):
 
     def __init__(self, cluster, namespace, set_name, ttl, pool_size=4, retry_limit=3, logger=None):
         """
@@ -42,18 +124,11 @@ class AsyncClient():
         :param retry_limit: limit for retrying times for failure records
         :return: None
         """
-        self._cluster = cluster
-        self._namespace = namespace
-        self._set_name = set_name
-        self._ttl = ttl
+        super(AsyncClient, self).__init__(cluster, namespace, set_name, ttl, retry_limit, logger)
 
         self._pool_size = pool_size
-        self._retry_limit = retry_limit
-        self._logger = logger
-
         self._task_queue = multiprocessing.JoinableQueue()
         self._failure_queue = multiprocessing.Queue()
-        self._processors = [_Processor(cluster, namespace, set_name, ttl, self._task_queue, self._failure_queue, self._retry_limit) for i in xrange(self._pool_size)]
 
     def put(self, records):
         """
@@ -61,7 +136,8 @@ class AsyncClient():
         :return: success record count and collection of failure records (after retries)
         """
 
-        for processor in self._processors:
+        processors = [_Processor(self._cluster, self._namespace, self._set_name, self._ttl, self._task_queue, self._failure_queue, self._retry_limit) for i in xrange(self._pool_size)]
+        for processor in processors:
             processor.start()
 
         total = len(records)
@@ -90,18 +166,17 @@ class AsyncClient():
             else:
                 break
 
-        for processor in self._processors:
+        for processor in processors:
             processor.join()
             processor.terminate()
 
         return len(records) - len(failure_records), failure_records
 
-    def _log(self, content):
-        log = '{timestamp}: {content}'.format(timestamp=datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d %H:%M:%S'), content=content)
-        if self._logger is None:
-            print log
-        else:
-            self._logger.logging(log)
+    def get(self, key):
+        pass
+
+    def close(self):
+        pass
 
 
 class _Processor(multiprocessing.Process):
@@ -137,6 +212,13 @@ class _Processor(multiprocessing.Process):
             # task_done() should be called after appending records to failure queue since processes should be blocked until all failure records are captured
             self._task_queue.task_done()
         return
+
+    def close(self):
+        for dao in self.aerospike_dao:
+            dao.close()
+
+    def __del__(self):
+        self.close()
 
 
 class _Put():
@@ -174,7 +256,7 @@ class _AerospikeDao():
         self._namespace = namespace
         self._set_name = set_name
         self._ttl = ttl
-        for attempt in xrange(2):
+        for attempt in xrange(3):
             try:
                 self._aerospike_client = aero.client({'hosts': [host]}).connect()
             except Exception as e:
@@ -192,10 +274,11 @@ class _AerospikeDao():
         """
         try:
             self._aerospike_client.put((self._namespace, self._set_name, key), bins, meta={'ttl': self._ttl})
-            return True
         except Exception as e:
             print e
             return False
+        else:
+            return True
 
     def get(self, key):
         """
@@ -204,10 +287,11 @@ class _AerospikeDao():
         """
         try:
             (key, meta, bins) = self._aerospike_client.get((self._namespace, self._set_name, key))
-            return bins
         except Exception as e:
             print e
             return None
+        else:
+            return bins
 
     def close(self):
         self._aerospike_client.close()
