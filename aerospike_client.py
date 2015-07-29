@@ -1,5 +1,4 @@
 
-
 # Copyright (c) 2015 Jinxiong Tan
 # GNU General public licence
 
@@ -114,19 +113,21 @@ class SyncClient(Client):
 
 class AsyncClient(Client):
 
-    def __init__(self, cluster, namespace, set_name, ttl, pool_size=4, retry_limit=3, logger=None):
+    def __init__(self, cluster, namespace, set_name, ttl, retry_limit=3, logger=None, pool_size=4, queue_size=256):
         """
         :param cluster: Aerospike cluster, should have the following format, [(host_1: port_1), (host_2: port_2), ..., (host_n: port_n)]
         :param namespace: Aerospike namespace
         :param set_name: Aerospike set
         :param ttl: time to live for records
-        :param pool_size: number of processes to load records
         :param retry_limit: limit for retrying times for failure records
+        :param pool_size: number of processes to load records
+        :param queue_size: the maximum capacity of blocking queue, by default it is set to 256
         :return: None
         """
         super(AsyncClient, self).__init__(cluster, namespace, set_name, ttl, retry_limit, logger)
 
         self._pool_size = pool_size
+        self._queue_size = queue_size
         self._task_queue = multiprocessing.JoinableQueue()
         self._failure_queue = multiprocessing.Queue()
 
@@ -144,6 +145,10 @@ class AsyncClient(Client):
         put_count = 0
         self._log('Loading records to {0}'.format(self._cluster))
         for record in records:
+            while True:
+                if self._task_queue.qsize() < self._queue_size:
+                    break
+                time.sleep(0.1)
             if not isinstance(record, Record):
                 raise Exception('Wrong type for aerospike object')
             if put_count % 1000 == 0 and put_count > 0:
