@@ -175,7 +175,7 @@ class AsyncClient(Client):
             processor.join()
             processor.terminate()
 
-        return len(records) - len(failure_records), failure_records
+        return len(records) * len(self._cluster) - len(failure_records), failure_records
 
     def get(self, key):
         pass
